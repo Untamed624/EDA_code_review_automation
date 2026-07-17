@@ -14,7 +14,7 @@ flowchart TD
     D --> E["final_repository.xlsx"]
     E --> F["data_collection.py 单次爬取 PR review/comment 数据"]
     E --> H["pr_batch_collection.py 分批爬取 PR review/comment 数据"]
-    F --> G["github_review_comment_dataset.json"]
+    F --> G["github_review_comment_dataset.jsonl"]
     H --> I["code_review_datasets/*.jsonl"]
 ```
 
@@ -46,6 +46,12 @@ Review/comment 数据集爬取：
 
 ```powershell
 python data_collection.py --github-token <your_github_token>
+```
+
+`data_collection.py` 现在默认输出 JSONL：
+
+```text
+code_review_datasets/github_review_comment_dataset.jsonl
 ```
 
 小规模测试可限制仓库数和 PR 数：
@@ -94,10 +100,10 @@ pr_count >= 200
 本次主元数据采集运行输出为：
 
 ```text
-Output: D:\c++\LLM4SE\github_hardware_language_projects.xlsx
-Filtered project count: 194
-Total PR count: 371722
-Output: D:\c++\LLM4SE\github_hardware_language_projects.csv
+Output: metadata\metadata_collection\github_hardware_language_projects.xlsx
+Filtered project count: 122
+Total PR count: 332703
+Output: metadata\metadata_collection\github_hardware_language_projects.csv
 ```
 
 ## 4. 第一语言补充与人工选择
@@ -145,19 +151,33 @@ final_repository.xlsx
 4. 通过 PR Review Comments API 获取 inline review comment，记录评论所在文件、行号、diff hunk、old code 和 new code。
 5. 通过 Issues Comments API 获取普通 PR conversation comment。
 6. 使用 GitHub GraphQL reviewThreads 查询 inline comment 所属讨论是否 resolved；无法获取时写入 `null`。
-7. 将所有记录统一写入 JSON 或 JSONL。
+7. 将所有记录统一写入 JSONL；如显式指定 `--format json`，也可输出 JSON 数组。
 
 默认输出为：
 
 ```text
-github_review_comment_dataset.json
+code_review_datasets/github_review_comment_dataset.jsonl
 ```
 
-也可以输出 JSONL：
+如果确实需要旧版 JSON 数组格式，可显式指定：
 
 ```powershell
-python data_collection.py --github-token <your_github_token> --format jsonl --output github_review_comment_dataset.jsonl
+python data_collection.py --github-token <your_github_token> --format json --output code_review_datasets/github_review_comment_dataset.json
 ```
+
+已有 JSON 数组文件可以用 `json_to_jsonl.py` 流式转换为 JSONL：
+
+```powershell
+python json_to_jsonl.py code_review_datasets\part_01_11.json
+```
+
+批量转换 `code_review_datasets/` 下所有 JSON 数组文件：
+
+```powershell
+python json_to_jsonl.py "code_review_datasets\*.json" --overwrite
+```
+
+转换脚本默认在原文件旁边生成同名 `.jsonl` 文件，例如 `part_01_11.json` 会生成 `part_01_11.jsonl`。它按记录流式读取，不会一次性把 100MB 以上的大 JSON 数组整体加载进内存。
 
 ### 5.1 `pr_batch_collection.py` 的必要性
 
@@ -216,7 +236,7 @@ code_review_datasets/<owner>_<repo>_repo001_prs0001_0100.jsonl.failed.jsonl
 
 ## 6. Review/Comment 数据字段
 
-`github_review_comment_dataset.json` 中每条记录代表一条 PR review 或 comment。核心字段包括：
+`github_review_comment_dataset.jsonl` 中每行代表一条 PR review 或 comment。核心字段包括：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -249,37 +269,96 @@ code_review_datasets/<owner>_<repo>_repo001_prs0001_0100.jsonl.failed.jsonl
 
 ## 7. 当前爬取结果
 
-当前目录中的 `github_review_comment_dataset.json` 统计结果为：
+当前完整数据集按仓库序号分成 4 个 JSONL 分片：
+
+```text
+code_review_datasets\part_01_11.jsonl
+code_review_datasets\part_12_22.jsonl
+code_review_datasets\part_23_33.jsonl
+code_review_datasets\part_34_44.jsonl
+```
+
+使用 `count_review_records.py --dedupe` 对 01-44 全部分片统计，去重后结果为：
+
+| 指标 | 数值 |
+| --- | ---: |
+| 总记录数 | 186844 |
+| top-level review 记录数 | 19390 |
+| inline review comment 记录数 | 109292 |
+| 普通 PR conversation comment 记录数 | 58162 |
+| 覆盖仓库数 | 42 |
+| 有记录 PR 数 | 26613 |
+| 去重跳过记录数 | 8 |
+
+这里的 `有记录 PR 数` 不是 `final_repository.xlsx` 中的 `pr_count` 总量。`final_repository.xlsx` 的 `pr_count` 合计为 57503，表示 44 个目标仓库在元数据阶段统计到的全部 PR 数；而 26613 只统计最终 JSONL 中实际出现过至少一条 `review`、`inline_comment` 或 `pr_comment` 记录的 PR。两者相差 30890，主要因为：
+
+- 很多 PR 没有任何可写入的 review/comment 正文，脚本不会为这类 PR 输出空记录。
+- top-level review 只有非空 `body` 才写入；例如只有无正文 `APPROVED` 的 review 不会生成记录。
+- `inline_comment` 和 `pr_comment` 也会跳过空正文。
+- 44 个目标仓库中有 2 个仓库没有生成任何记录：`ultraembedded/riscv` 和 `riscv-mcu/e203_hbirdv2`，它们在最终仓库表中的 `pr_count` 合计为 32。
+
+因此，当前数据集覆盖的是“有实际 review/comment 文本或行内评论内容的 PR”，不是所有被枚举到的 PR。
+
+`comment_type = "review"` 的 review state 分布为：
+
+| review_state | 数量 |
+| --- | ---: |
+| `APPROVED` | 13215 |
+| `COMMENTED` | 4478 |
+| `CHANGES_REQUESTED` | 1530 |
+| `DISMISSED` | 167 |
+
+各分片统计如下：
+
+| 文件 | 记录数 | review | inline_comment | pr_comment | 覆盖仓库数 | 有记录 PR 数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `part_01_11.jsonl` | 32678 | 2264 | 16442 | 13972 | 11 | 5897 |
+| `part_12_22.jsonl` | 120153 | 14000 | 77012 | 29141 | 10 | 14004 |
+| `part_23_33.jsonl` | 19268 | 1341 | 7101 | 10826 | 11 | 4066 |
+| `part_34_44.jsonl` | 14745 | 1785 | 8737 | 4223 | 10 | 2646 |
+
+未去重的原始统计为 186852 条记录，其中普通 PR conversation comment 为 58170 条；去重后减少的 8 条重复记录均来自 `part_23_33.jsonl`。
+
+当前目录中的 `github_review_comment_dataset.json` 是早期 JSON 数组样例文件；新的默认输出文件名为 `github_review_comment_dataset.jsonl`。
 
 | 文件 | 记录数 | 覆盖仓库数 | comment 类型分布 |
 | --- | ---: | ---: | --- |
-| `github_review_comment_dataset.json` | 18 | 1 | `review`: 2, `pr_comment`: 16 |
+| `github_review_comment_dataset.json` | 343 | 1 | `review`: 171, `inline_comment`: 125, `pr_comment`: 47 |
 
-当前样例结果中尚未出现 `inline_comment` 记录，但脚本已经包含 inline review comment 的爬取逻辑。全量运行或处理含代码行评论的 PR 时，会生成 `comment_type = "inline_comment"` 的记录。
+当前样例结果已经包含 `inline_comment` 记录；这类记录会额外包含文件路径、行号、diff hunk、旧代码片段、新代码片段和 `is_resolved` 等字段。
 
 ## 8. 当前 CSV/XLSX 产物汇总
 
-当前文件夹中的所有 CSV 和 XLSX 结果文件如下：
+当前 `metadata/` 目录中的 CSV 和 XLSX 结果文件如下：
 
 | 文件 | 类型 | 行数 | 主要字段 |
 | --- | --- | ---: | --- |
-| `final_repository.xlsx` | xlsx | 44 | `repo_name`, `full_name`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_hardware_language_projects.csv` | csv | 194 | `repo_name`, `full_name`, `top3_languages`, `top3_has_required_hdl`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_hardware_language_projects.xlsx` | xlsx | 194 | `repo_name`, `full_name`, `top3_languages`, `top3_has_required_hdl`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_scala_projects.csv` | csv | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_scala_projects.xlsx` | xlsx | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_systemverilog_projects.csv` | csv | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_systemverilog_projects.xlsx` | xlsx | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_verilog_projects.csv` | csv | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_verilog_projects.xlsx` | xlsx | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_vhdl_projects.csv` | csv | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `github_vhdl_projects.xlsx` | xlsx | 1000 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
-| `hardware_language_candidates.csv` | csv | 800 | `name`, `full_name`, `language`, `stars`, `forks`, `topics`, `url`, `updated_at`, `contributors_count`, `hardware_score`, `hardware_file_count`, `hardware_file_examples`, `hardware_filter_reason`, `is_hardware_candidate` |
-| `metadata.csv` | csv | 96 | `repo_name`, `full_name`, `top3_languages`, `top3_has_required_hdl`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\final_repository.xlsx` | xlsx | 44 | `repo_name`, `full_name`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\metadata_collection\github_hardware_language_projects.csv` | csv | 122 | `repo_name`, `full_name`, `top3_languages`, `top3_has_required_hdl`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\metadata_collection\github_hardware_language_projects.xlsx` | xlsx | 122 | `repo_name`, `full_name`, `top3_languages`, `top3_has_required_hdl`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_scala_projects.csv` | csv | 465 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_scala_projects.xlsx` | xlsx | 465 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_systemverilog_projects.csv` | csv | 36 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_systemverilog_projects.xlsx` | xlsx | 36 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_verilog_projects.csv` | csv | 82 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_verilog_projects.xlsx` | xlsx | 82 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_vhdl_projects.csv` | csv | 24 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+| `metadata\main_language_collection\github_vhdl_projects.xlsx` | xlsx | 24 | `repo_name`, `full_name`, `target_language`, `primary_language`, `primary_language_matches_target`, `top3_languages`, `topics`, `url`, `stars`, `forks_count`, `pr_count` |
+
+核心数值汇总：
+
+| 项目 | 数值 |
+| --- | ---: |
+| 主元数据筛选仓库数 | 122 |
+| 主元数据筛选仓库 `pr_count` 合计 | 332703 |
+| 第一语言补充候选仓库数合计 | 607 |
+| 人工筛选后的最终仓库数 | 44 |
+| 最终仓库列表 `pr_count` 合计 | 57503 |
 
 其中：
 
 - `github_hardware_language_projects.*` 是主元数据筛选结果。
 - `github_*_projects.*` 是按第一语言补充检索得到的候选结果。
 - `final_repository.xlsx` 是人工筛选后的最终仓库列表，也是 `data_collection.py` 的默认输入。
-- `github_review_comment_dataset.json` 是基于最终仓库列表爬取出的 review/comment 数据集。
+- `github_review_comment_dataset.jsonl` 是 `data_collection.py` 新的默认 review/comment 数据集输出格式。
+- `json_to_jsonl.py` 用于把已有 JSON 数组文件转换成 JSONL，方便后续合并、断点处理和训练读取。
